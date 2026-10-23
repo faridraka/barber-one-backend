@@ -1,0 +1,30 @@
+# Docker build
+Dockerfile
+barber-backend
+*.exe
+
+# Go
+go.sum
+go.mod
+vendor
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Environment files (optional - uncomment if you want to exclude .env from Docker)
+# .env
+# .env.*

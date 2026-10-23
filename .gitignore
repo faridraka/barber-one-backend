@@ -1,0 +1,16 @@
+# Environment (simpan contoh di .env.example)
+.env
+.env.*
+!.env.example
+
+# Hasil go build
+/backend
+/barber-one
+*.exe
+/bin/
+/tmp/
+
+# Hasil test
+*.test
+*.out
+coverage.html
