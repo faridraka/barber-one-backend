@@ -66,6 +66,11 @@ func LoadConfig() (*Config, error) {
 }
 
 func getEnvValue(key, fallback string) string {
+	// Deployment platforms (including Render) provide configuration through
+	// the process environment. Prefer it over values loaded from a local .env.
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
 	if value, exists := envValues[key]; exists && value != "" {
 		return strings.TrimSpace(value)
 	}
