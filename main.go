@@ -60,8 +60,8 @@ func main() {
 	barberController := controller.NewBarberController(barberService)
 	reviewController := controller.NewReviewController(reviewService, sessionStore)
 	cashierController := controller.NewCashierController(cashierService, sessionStore)
-	paymentController := controller.NewPaymentController(midtransService)
-	ticketController := controller.NewTicketController(sessionStore)
+	paymentController := controller.NewPaymentController(bookingService)
+	ticketController := controller.NewTicketController(bookingService, sessionStore)
 
 	// Initialize workers
 	workerService := service.NewWorkerService(db)
@@ -148,7 +148,7 @@ layout: "StandaloneLayout"
 				return
 			}
 		}
-		if len(parts) == 5 && parts[0] == "api" && parts[1] == "bookings" && parts[3] == "payment" && r.Method == http.MethodPost {
+		if len(parts) == 4 && parts[0] == "api" && parts[1] == "bookings" && parts[3] == "payment" && r.Method == http.MethodPost {
 			if bookingID, err := strconv.ParseInt(parts[2], 10, 64); err == nil {
 				bookingController.CreatePayment(w, r, bookingID)
 				return

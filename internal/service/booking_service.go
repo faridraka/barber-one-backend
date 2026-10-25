@@ -2,8 +2,12 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	"barber-one/backend/internal/dto"
@@ -74,16 +78,17 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 		return nil, errors.New("durasi layanan melewati jam operasional")
 	}
 
-	// Generate ticket code
-	ticketCode := fmt.Sprintf("BK-%d", time.Now().UnixNano())
+	// Generate ticket code (bookings.ticket_code is VARCHAR(20))
+	ticketCode, err := newTicketCode()
+	if err != nil {
+		return nil, errors.New("gagal membuat kode tiket")
+	}
 
 	// Create booking
 	notes := req.Notes
-	if notes == "" {
-		notes = ""
-	}
 	bookingID, err := s.repo.CreateBooking(ctx, ticketCode, &userID, req.CustomerName, req.CustomerPhone, req.ServiceID, req.BarberID, req.BookingDate, req.BookingTime, &notes)
 	if err != nil {
+		log.Printf("create booking failed: %v", err)
 		return nil, errors.New("gagal membuat booking")
 	}
 
@@ -91,6 +96,11 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 	serviceName, _ := service["name"].(string)
 	_, _, gatewayRedirectURL, _, err := s.startPayment(ctx, bookingID, ticketCode, req.CustomerName, req.CustomerPhone, amount, serviceName)
 	if err != nil {
+		log.Printf("start payment for booking %d failed: %v", bookingID, err)
+		// Free the slot again: a booking without a payment session cannot be paid.
+		if delErr := s.repo.DeleteBooking(ctx, bookingID); delErr != nil {
+			log.Printf("rollback booking %d failed: %v", bookingID, delErr)
+		}
 		return nil, err
 	}
 
@@ -104,6 +114,15 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 			PaymentRedirectURL: gatewayRedirectURL,
 		},
 	}, nil
+}
+
+// newTicketCode returns a code like "BK-3F9A1C2E" (11 chars).
+func newTicketCode() (string, error) {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return "BK-" + strings.ToUpper(hex.EncodeToString(b)), nil
 }
 
 func asInt(v any) int {
@@ -287,12 +306,21 @@ func (s *BookingService) CreatePayment(ctx context.Context, bookingID, userID in
 		return "", errors.New("booking tidak ditemukan")
 	}
 
+	if status, _ := booking["status"].(string); status == "Batal" || status == "Selesai" {
+		return "", errors.New("booking ini sudah tidak aktif")
+	}
+
 	paymentStatus := booking["payment_status"].(*string)
 	if paymentStatus != nil && *paymentStatus == "Lunas" {
 		return "", errors.New("booking ini sudah dibayar")
 	}
 
+	// Reuse the open Snap session. Once it expires the payment expiry worker
+	// cancels the booking, so a new session would be cancelled with it.
 	if paymentStatus != nil && *paymentStatus == "Menunggu" {
+		if expiresAt := booking["expires_at"].(*time.Time); expiresAt != nil && !time.Now().Before(*expiresAt) {
+			return "", errors.New("sesi pembayaran sudah kedaluwarsa. Silakan buat booking baru")
+		}
 		redirectURL := booking["payment_redirect_url"].(*string)
 		if redirectURL != nil && *redirectURL != "" {
 			return *redirectURL, nil
@@ -306,3 +334,119 @@ func (s *BookingService) CreatePayment(ctx context.Context, bookingID, userID in
 	_, _, redirectURL, _, err := s.startPayment(ctx, bookingID, ticketCode, name, phone, amount, serviceName)
 	return redirectURL, err
 }
+
+// GetMyTickets returns the user's active ticket, visit history, and stats
+func (s *BookingService) GetMyTickets(ctx context.Context, userID int64) (*dto.MyTicketsResponse, error) {
+	profile, err := s.repo.GetUserProfile(ctx, userID)
+	if err != nil {
+		return nil, errors.New("gagal mengambil profil")
+	}
+	rows, err := s.repo.GetMyTickets(ctx, userID)
+	if err != nil {
+		log.Printf("get my tickets failed: %v", err)
+		return nil, errors.New("gagal mengambil tiket")
+	}
+
+	resp := &dto.MyTicketsResponse{
+		User: dto.RegisteredUser{
+			ID:    profile["id"].(int64),
+			Name:  profile["name"].(string),
+			Phone: profile["phone"].(string),
+			Email: profile["email"].(*string),
+			Role:  profile["role"].(string),
+		},
+		History: []dto.TicketBooking{},
+	}
+
+	barberVisits := map[string]int{}
+	// Rows are ordered by schedule ascending: the first open booking is the active one.
+	for _, t := range rows {
+		ticket := dto.TicketBooking{
+			ID:                 t["id"].(int64),
+			TicketCode:         t["ticket_code"].(string),
+			Status:             t["status"].(string),
+			BookingDate:        t["booking_date"].(string),
+			BookingTime:        t["booking_time"].(string),
+			ChairNumber:        asInt(t["chair_number"]),
+			Notes:              t["notes"].(string),
+			ServiceName:        t["service_name"].(string),
+			ServiceDesc:        t["service_description"].(*string),
+			DurationMinutes:    asInt(t["duration_minutes"]),
+			Price:              t["price"].(float64),
+			TotalAmount:        t["total_amount"].(float64),
+			BarberName:         t["barber_name"].(string),
+			BarberRating:       t["barber_rating"].(float64),
+			PaymentMethod:      t["payment_method"].(*string),
+			PaymentStatus:      t["payment_status"].(*string),
+			PaymentRedirectURL: t["payment_redirect_url"].(*string),
+			PaymentExpiresAt:   t["expires_at"].(*time.Time),
+		}
+		failed := ticket.PaymentStatus != nil && *ticket.PaymentStatus == "Gagal"
+		switch {
+		case ticket.Status == "Selesai":
+			resp.Stats.Visits++
+			barberVisits[ticket.BarberName]++
+			resp.History = append(resp.History, ticket)
+		case ticket.Status == "Batal" || failed:
+			resp.History = append(resp.History, ticket)
+		case resp.Active == nil:
+			active := ticket
+			resp.Active = &active
+		}
+	}
+
+	// History newest first
+	for i, j := 0, len(resp.History)-1; i < j; i, j = i+1, j-1 {
+		resp.History[i], resp.History[j] = resp.History[j], resp.History[i]
+	}
+	for name, count := range barberVisits {
+		if count > barberVisits[resp.Stats.FavoriteBarber] {
+			resp.Stats.FavoriteBarber = name
+		}
+	}
+	return resp, nil
+}
+
+// HandleMidtransNotification verifies a Midtrans notification and stores the payment result
+func (s *BookingService) HandleMidtransNotification(ctx context.Context, n dto.MidtransNotification) error {
+	if s.midtrans == nil {
+		return ErrPaymentUnavailable
+	}
+	if !s.midtrans.VerifySignature(n.OrderID, n.StatusCode, n.GrossAmount, n.SignatureKey) {
+		return ErrInvalidSignature
+	}
+
+	var paymentStatus string
+	switch n.TransactionStatus {
+	case "settlement":
+		paymentStatus = "Lunas"
+	case "capture":
+		if n.FraudStatus == "" || n.FraudStatus == "accept" {
+			paymentStatus = "Lunas"
+		} else {
+			paymentStatus = "Menunggu"
+		}
+	case "pending":
+		paymentStatus = "Menunggu"
+	case "deny", "cancel", "expire", "failure":
+		paymentStatus = "Gagal"
+	default:
+		// refund, partial_refund, etc. are not handled by this app
+		return nil
+	}
+
+	found, err := s.repo.ApplyPaymentNotification(ctx, n.OrderID, paymentStatus)
+	if err != nil {
+		log.Printf("apply midtrans notification %s failed: %v", n.OrderID, err)
+		return errors.New("gagal memproses notifikasi")
+	}
+	if !found {
+		log.Printf("midtrans notification for unknown order %s", n.OrderID)
+	}
+	return nil
+}
+
+var (
+	ErrPaymentUnavailable = errors.New("pembayaran belum dikonfigurasi")
+	ErrInvalidSignature   = errors.New("signature notifikasi tidak valid")
+)

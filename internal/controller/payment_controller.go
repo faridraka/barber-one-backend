@@ -2,20 +2,22 @@ package controller
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 
+	"barber-one/backend/internal/dto"
 	"barber-one/backend/internal/middleware"
 	"barber-one/backend/internal/service"
 )
 
 // PaymentController handles payment notifications
 type PaymentController struct {
-	midtransService *service.MidtransService
+	bookingService *service.BookingService
 }
 
-func NewPaymentController(midtransService *service.MidtransService) *PaymentController {
-	return &PaymentController{midtransService: midtransService}
+func NewPaymentController(bookingService *service.BookingService) *PaymentController {
+	return &PaymentController{bookingService: bookingService}
 }
 
 // MidtransNotification handles POST /payments/midtrans/notification
@@ -36,19 +38,21 @@ func (c *PaymentController) MidtransNotification(w http.ResponseWriter, r *http.
 		return
 	}
 
-	var notification map[string]any
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&notification); err != nil {
+	var notification dto.MidtransNotification
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&notification); err != nil || notification.OrderID == "" {
 		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "Notifikasi tidak valid."})
 		return
 	}
 
-	orderID := notification["order_id"].(string)
-	statusCode := notification["status_code"].(string)
-	grossAmount := notification["gross_amount"].(string)
-	signatureKey := notification["signature_key"].(string)
-
-	if !c.midtransService.VerifySignature(orderID, statusCode, grossAmount, signatureKey) {
-		middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "Signature notifikasi tidak valid."})
+	if err := c.bookingService.HandleMidtransNotification(r.Context(), notification); err != nil {
+		switch {
+		case errors.Is(err, service.ErrInvalidSignature):
+			middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		case errors.Is(err, service.ErrPaymentUnavailable):
+			middleware.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"error": err.Error()})
+		default:
+			middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		}
 		return
 	}
 

@@ -4,15 +4,17 @@ import (
 	"net/http"
 
 	"barber-one/backend/internal/middleware"
+	"barber-one/backend/internal/service"
 )
 
 // TicketController handles ticket requests
 type TicketController struct {
-	sessionStore *middleware.SessionStore
+	bookingService *service.BookingService
+	sessionStore   *middleware.SessionStore
 }
 
-func NewTicketController(sessionStore *middleware.SessionStore) *TicketController {
-	return &TicketController{sessionStore: sessionStore}
+func NewTicketController(bookingService *service.BookingService, sessionStore *middleware.SessionStore) *TicketController {
+	return &TicketController{bookingService: bookingService, sessionStore: sessionStore}
 }
 
 // MyTickets handles GET /my-tickets
@@ -35,25 +37,10 @@ func (c *TicketController) MyTickets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"user": map[string]any{
-			"id":    userID,
-			"name":  "User Name",
-			"phone": "081234567890",
-			"email": nil,
-			"role":  "user",
-		},
-		"stats": map[string]any{
-			"visits":         5,
-			"favorite_barber": "Barber 1",
-		},
-		"active": map[string]any{
-			"id":           1,
-			"ticket_code":  "BK-ABC123",
-			"status":       "Dikonfirmasi",
-			"booking_date": "2026-10-25",
-			"booking_time": "10:00",
-		},
-		"history": []map[string]any{},
-	})
+	tickets, err := c.bookingService.GetMyTickets(r.Context(), userID)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusOK, tickets)
 }

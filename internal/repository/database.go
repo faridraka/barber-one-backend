@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -188,11 +190,18 @@ func (r *Repository) CreateBooking(ctx context.Context, ticketCode string, userI
 	return id, err
 }
 
+// DeleteBooking removes a booking whose payment session could not be created,
+// so the slot is not left blocked by an unpayable booking.
+func (r *Repository) DeleteBooking(ctx context.Context, bookingID int64) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM bookings WHERE id = $1`, bookingID)
+	return err
+}
+
 func (r *Repository) GetUserBookings(ctx context.Context, userID int64) ([]map[string]any, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT b.id, b.ticket_code, b.status, b.customer_name, b.customer_phone,
 		       b.service_id, s.name, s.price, s.duration_minutes,
-		       b.barber_id, br.name, b.booking_date, b.booking_time, COALESCE(b.notes, ''),
+		       b.barber_id, br.name, b.booking_date::text, b.booking_time, COALESCE(b.notes, ''),
 		       COALESCE(t.total_amount, s.price), t.payment_method, t.payment_status, t.gateway_redirect_url, t.expires_at
 		FROM bookings b
 		JOIN services s ON s.id = b.service_id
@@ -274,7 +283,7 @@ func (r *Repository) GetBookingByID(ctx context.Context, bookingID, userID int64
 	err := r.db.QueryRow(ctx, `
 		SELECT b.id, b.ticket_code, b.status, b.customer_name, b.customer_phone,
 		       b.service_id, s.name, s.price, s.duration_minutes,
-		       b.barber_id, br.name, b.booking_date, b.booking_time, b.chair_number, COALESCE(b.notes, ''),
+		       b.barber_id, br.name, b.booking_date::text, b.booking_time, b.chair_number, COALESCE(b.notes, ''),
 		       COALESCE(t.total_amount, s.price), t.payment_method, t.payment_status, t.gateway_redirect_url, t.expires_at
 		FROM bookings b
 		JOIN services s ON s.id = b.service_id
@@ -368,6 +377,63 @@ func (r *Repository) UpdateTransactionPaymentStatus(ctx context.Context, gateway
 		paymentStatus, paymentStatus == "Lunas", gatewayOrderID,
 	)
 	return tag.RowsAffected(), err
+}
+
+// ApplyPaymentNotification updates a Midtrans transaction and its booking.
+// Returns false when the order ID is unknown.
+func (r *Repository) ApplyPaymentNotification(ctx context.Context, gatewayOrderID, paymentStatus string) (bool, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var bookingID int64
+	var current string
+	err = tx.QueryRow(ctx,
+		`SELECT booking_id, payment_status FROM transactions WHERE gateway_order_id = $1 FOR UPDATE`,
+		gatewayOrderID,
+	).Scan(&bookingID, &current)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// A paid transaction never goes back to pending/failed.
+	if current == "Lunas" {
+		return true, tx.Commit(ctx)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE transactions SET payment_status = $1, paid_at = CASE WHEN $2 THEN CURRENT_TIMESTAMP ELSE paid_at END WHERE gateway_order_id = $3`,
+		paymentStatus, paymentStatus == "Lunas", gatewayOrderID,
+	); err != nil {
+		return false, err
+	}
+
+	switch paymentStatus {
+	case "Lunas":
+		_, err = tx.Exec(ctx,
+			`UPDATE bookings SET status = 'Dikonfirmasi', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND status = 'Menunggu'`,
+			bookingID,
+		)
+	case "Gagal":
+		// Only cancel when no other payment session for this booking is still open or paid.
+		_, err = tx.Exec(ctx,
+			`UPDATE bookings SET status = 'Batal', updated_at = CURRENT_TIMESTAMP
+			 WHERE id = $1 AND status = 'Menunggu'
+			   AND NOT EXISTS (
+				SELECT 1 FROM transactions
+				WHERE booking_id = $1 AND gateway_order_id <> $2 AND payment_status IN ('Menunggu', 'Lunas')
+			   )`,
+			bookingID, gatewayOrderID,
+		)
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }
 
 func (r *Repository) GetTransactionByGatewayOrderID(ctx context.Context, gatewayOrderID string) (map[string]any, error) {
@@ -524,7 +590,7 @@ func (r *Repository) GetBarberDetails(ctx context.Context, barberID int64) (bool
 func (r *Repository) GetCashierQueue(ctx context.Context, date string) ([]map[string]any, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT b.id, b.ticket_code, b.status, b.user_id IS NULL, b.customer_name, b.customer_phone,
-		       s.name, s.duration_minutes, b.barber_id, br.name, b.chair_number, b.booking_date, b.booking_time,
+		       s.name, s.duration_minutes, b.barber_id, br.name, b.chair_number, b.booking_date::text, b.booking_time,
 		       COALESCE(t.total_amount, s.price), t.payment_method, t.payment_status, b.started_at
 		FROM bookings b
 		JOIN services s ON s.id = b.service_id
@@ -724,7 +790,7 @@ func (r *Repository) GetBookingForUpdate(ctx context.Context, bookingID, userID 
 	var createdAt time.Time
 	err := r.db.QueryRow(ctx,
 		`SELECT b.id, b.ticket_code, b.status, b.service_id, s.duration_minutes,
-		       b.barber_id, b.booking_date, b.booking_time, b.created_at
+		       b.barber_id, b.booking_date::text, b.booking_time, b.created_at
 		 FROM bookings b JOIN services s ON s.id = b.service_id
 		 WHERE b.id = $1 AND b.user_id = $2 FOR UPDATE OF b`, bookingID, userID,
 	).Scan(&id, &ticketCode, &status, &serviceID, &durationMinutes,
@@ -792,7 +858,7 @@ func (r *Repository) GetServicePrice(ctx context.Context, serviceID int64) (floa
 
 func (r *Repository) GetMyTickets(ctx context.Context, userID int64) ([]map[string]any, error) {
 	rows, err := r.db.Query(ctx,
-		`SELECT b.id, b.ticket_code, b.status, b.booking_date, b.booking_time, b.chair_number,
+		`SELECT b.id, b.ticket_code, b.status, b.booking_date::text, b.booking_time, b.chair_number,
 		        COALESCE(b.notes, ''), s.name, s.description, s.duration_minutes, s.price,
 		        COALESCE(t.total_amount, s.price), br.name, br.rating, t.payment_method, t.payment_status,
 		        t.gateway_redirect_url, t.expires_at
