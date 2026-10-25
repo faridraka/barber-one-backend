@@ -1,9 +1,11 @@
 package controller
 
 import (
+	"log"
 	"net/http"
 	"time"
 
+	"barber-one/backend/internal/dto"
 	"barber-one/backend/internal/middleware"
 	"barber-one/backend/internal/service"
 )
@@ -49,15 +51,18 @@ func (c *CashierController) GetQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.URL.Query().Get("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	date, ok := cashierDate(w, r)
+	if !ok {
+		return
 	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"date":  date,
-		"queue": []map[string]any{},
-	})
+	queue, err := c.cashierService.GetQueue(r.Context(), date)
+	if err != nil {
+		log.Printf("cashier queue failed: %v", err)
+		middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal mengambil antrean."})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusOK, dto.CashierQueueResponse{Date: date, ServerTime: time.Now(), Queue: queue})
 }
 
 // GetSummary handles GET /cashier/summary
@@ -81,21 +86,31 @@ func (c *CashierController) GetSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	date := r.URL.Query().Get("date")
-	if date == "" {
-		date = time.Now().Format("2006-01-02")
+	date, ok := cashierDate(w, r)
+	if !ok {
+		return
 	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"date":         date,
-		"waiting":      0,
-		"in_service":   0,
-		"done":         0,
-		"total_chairs": 3,
-		"revenue":      0,
-		"cash_count":   0,
-		"non_cash_count": 0,
-	})
+	summary, err := c.cashierService.GetSummary(r.Context(), date)
+	if err != nil {
+		log.Printf("cashier summary failed: %v", err)
+		middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal mengambil ringkasan."})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusOK, summary)
+}
+
+// cashierDate reads ?date=YYYY-MM-DD, defaulting to today in WIB (the server may run in UTC).
+func cashierDate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		return time.Now().In(time.FixedZone("WIB", 7*60*60)).Format("2006-01-02"), true
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "Format tanggal harus YYYY-MM-DD."})
+		return "", false
+	}
+	return date, true
 }
 
 // WalkIn handles POST /cashier/walk-in

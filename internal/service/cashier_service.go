@@ -40,13 +40,13 @@ func (s *CashierService) GetSummary(ctx context.Context, date string) (dto.Cashi
 
 	return dto.CashierSummaryResponse{
 		Date:         date,
-		Waiting:      int(waiting["waiting"].(int64)),
-		InService:    int(waiting["in_service"].(int64)),
-		Done:         int(waiting["done"].(int64)),
+		Waiting:      asInt(waiting["waiting"]),
+		InService:    asInt(waiting["in_service"]),
+		Done:         asInt(waiting["done"]),
 		TotalChairs:  3,
 		Revenue:      revenue["revenue"].(float64),
-		CashCount:    int(revenue["cash_count"].(int64)),
-		NonCashCount: int(revenue["non_cash_count"].(int64)),
+		CashCount:    asInt(revenue["cash_count"]),
+		NonCashCount: asInt(revenue["non_cash_count"]),
 	}, nil
 }
 
@@ -79,16 +79,16 @@ func convertToCashierQueueItem(items []map[string]any) []dto.CashierQueueItem {
 			CustomerName:    item["customer_name"].(string),
 			CustomerPhone:   item["customer_phone"].(string),
 			ServiceName:     item["service_name"].(string),
-			DurationMinutes: int(item["duration_minutes"].(int64)),
+			DurationMinutes: asInt(item["duration_minutes"]),
 			BarberID:        int64(item["barber_id"].(int64)),
 			BarberName:      item["barber_name"].(string),
-			ChairNumber:     int(item["chair_number"].(int64)),
+			ChairNumber:     asInt(item["chair_number"]),
 			BookingDate:     item["booking_date"].(string),
 			BookingTime:     item["booking_time"].(string),
 			TotalAmount:     item["total_amount"].(float64),
-			PaymentMethod:   func() *string { s := item["payment_method"].(string); return &s }(),
-			PaymentStatus:   func() *string { s := item["payment_status"].(string); return &s }(),
-			StartedAt:       func() *time.Time { t := item["started_at"].(time.Time); return &t }(),
+			PaymentMethod:   item["payment_method"].(*string),
+			PaymentStatus:   item["payment_status"].(*string),
+			StartedAt:       item["started_at"].(*time.Time),
 		})
 	}
 	return result
