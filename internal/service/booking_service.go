@@ -12,11 +12,12 @@ import (
 
 // BookingService handles booking business logic
 type BookingService struct {
-	repo *repository.Repository
+	repo     *repository.Repository
+	midtrans *MidtransService
 }
 
-func NewBookingService(repo *repository.Repository) *BookingService {
-	return &BookingService{repo: repo}
+func NewBookingService(repo *repository.Repository, midtrans *MidtransService) *BookingService {
+	return &BookingService{repo: repo, midtrans: midtrans}
 }
 
 // CreateBooking handles creating a new booking
@@ -50,12 +51,13 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 	}
 
 	// Check if barber is available
-	if !barber["available"].(bool) {
+	available, _ := barber["available"].(bool)
+	if !available {
 		return nil, errors.New("barber sedang tidak tersedia")
 	}
 
 	// Check slot availability
-	duration := int(service["duration_minutes"].(int64))
+	duration := asInt(service["duration_minutes"])
 	hasConflict, err := s.repo.CheckSlotAvailability(ctx, req.BarberID, req.BookingDate, req.BookingTime, duration)
 	if err != nil {
 		return nil, errors.New("gagal memeriksa slot")
@@ -85,20 +87,11 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 		return nil, errors.New("gagal membuat booking")
 	}
 
-	// Create transaction
-	amount := service["price"].(float64)
-	orderID := fmt.Sprintf("%s-%d", ticketCode, time.Now().Unix())
-	_ = orderID // For future use
-	paymentStartedAt := time.Now()
-	expiresAt := paymentStartedAt.Add(5 * time.Minute)
-
-	gatewayOrderID := orderID
-	gatewayToken := "dummy_token"
-	gatewayRedirectURL := "http://localhost:3000/api/payments/midtrans/notification"
-
-	_, err = s.repo.CreateTransaction(ctx, bookingID, amount, "Midtrans", gatewayOrderID, gatewayToken, gatewayRedirectURL, expiresAt)
+	amount, _ := service["price"].(float64)
+	serviceName, _ := service["name"].(string)
+	_, _, gatewayRedirectURL, _, err := s.startPayment(ctx, bookingID, ticketCode, req.CustomerName, req.CustomerPhone, amount, serviceName)
 	if err != nil {
-		return nil, errors.New("gagal membuat transaksi")
+		return nil, err
 	}
 
 	return &dto.CreateBookingResponse{
@@ -113,6 +106,36 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 	}, nil
 }
 
+func asInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func (s *BookingService) startPayment(ctx context.Context, bookingID int64, ticketCode, name, phone string, amount float64, serviceName string) (string, string, string, time.Time, error) {
+	if s.midtrans == nil {
+		return "", "", "", time.Time{}, errors.New("pembayaran belum tersedia: konfigurasi MIDTRANS_SERVER_KEY belum diatur")
+	}
+	startedAt := time.Now()
+	orderID := fmt.Sprintf("%s-%d", ticketCode, startedAt.UnixNano())
+	result, err := s.midtrans.CreateSnap(ctx, orderID, name, phone, amount, serviceName, "", startedAt)
+	if err != nil {
+		return "", "", "", time.Time{}, fmt.Errorf("gagal membuat sesi pembayaran Midtrans: %w", err)
+	}
+	expiresAt := startedAt.Add(5 * time.Minute)
+	if _, err := s.repo.CreateTransaction(ctx, bookingID, amount, "Midtrans", orderID, result["token"], result["redirect_url"], expiresAt); err != nil {
+		return "", "", "", time.Time{}, errors.New("gagal menyimpan transaksi pembayaran")
+	}
+	return orderID, result["token"], result["redirect_url"], expiresAt, nil
+}
+
 // ListUserBookings returns all bookings for a user
 func (s *BookingService) ListUserBookings(ctx context.Context, userID int64) ([]dto.UserBooking, error) {
 	bookings, err := s.repo.GetUserBookings(ctx, userID)
@@ -123,25 +146,25 @@ func (s *BookingService) ListUserBookings(ctx context.Context, userID int64) ([]
 	result := make([]dto.UserBooking, 0, len(bookings))
 	for _, b := range bookings {
 		result = append(result, dto.UserBooking{
-			ID:              b["id"].(int64),
-			TicketCode:      b["ticket_code"].(string),
-			Status:          b["status"].(string),
-			CustomerName:    b["customer_name"].(string),
-			CustomerPhone:   b["customer_phone"].(string),
-			ServiceID:       b["service_id"].(int64),
-			ServiceName:     b["service_name"].(string),
-			Price:           b["price"].(float64),
-			DurationMinutes: int(b["duration_minutes"].(int64)),
-			BarberID:        b["barber_id"].(int64),
-			BarberName:      b["barber_name"].(string),
-			BookingDate:     b["booking_date"].(string),
-			BookingTime:     b["booking_time"].(string),
-			Notes:           b["notes"].(string),
-			TotalAmount:     b["total_amount"].(float64),
-			PaymentMethod:   b["payment_method"].(*string),
-			PaymentStatus:   b["payment_status"].(*string),
+			ID:                 b["id"].(int64),
+			TicketCode:         b["ticket_code"].(string),
+			Status:             b["status"].(string),
+			CustomerName:       b["customer_name"].(string),
+			CustomerPhone:      b["customer_phone"].(string),
+			ServiceID:          b["service_id"].(int64),
+			ServiceName:        b["service_name"].(string),
+			Price:              b["price"].(float64),
+			DurationMinutes:    asInt(b["duration_minutes"]),
+			BarberID:           b["barber_id"].(int64),
+			BarberName:         b["barber_name"].(string),
+			BookingDate:        b["booking_date"].(string),
+			BookingTime:        b["booking_time"].(string),
+			Notes:              b["notes"].(string),
+			TotalAmount:        b["total_amount"].(float64),
+			PaymentMethod:      b["payment_method"].(*string),
+			PaymentStatus:      b["payment_status"].(*string),
 			PaymentRedirectURL: b["payment_redirect_url"].(*string),
-			PaymentExpiresAt: b["expires_at"].(*time.Time),
+			PaymentExpiresAt:   b["expires_at"].(*time.Time),
 		})
 	}
 	return result, nil
@@ -155,26 +178,26 @@ func (s *BookingService) GetBookingDetail(ctx context.Context, bookingID, userID
 	}
 
 	return &dto.UserBooking{
-		ID:              booking["id"].(int64),
-		TicketCode:      booking["ticket_code"].(string),
-		Status:          booking["status"].(string),
-		CustomerName:    booking["customer_name"].(string),
-		CustomerPhone:   booking["customer_phone"].(string),
-		ServiceID:       booking["service_id"].(int64),
-		ServiceName:     booking["service_name"].(string),
-		Price:           booking["price"].(float64),
-		DurationMinutes: int(booking["duration_minutes"].(int64)),
-		BarberID:        booking["barber_id"].(int64),
-		BarberName:      booking["barber_name"].(string),
-		BookingDate:     booking["booking_date"].(string),
-		BookingTime:     booking["booking_time"].(string),
-		ChairNumber:     int(booking["chair_number"].(int64)),
-		Notes:           booking["notes"].(string),
-		TotalAmount:     booking["total_amount"].(float64),
-		PaymentMethod:   booking["payment_method"].(*string),
-		PaymentStatus:   booking["payment_status"].(*string),
+		ID:                 booking["id"].(int64),
+		TicketCode:         booking["ticket_code"].(string),
+		Status:             booking["status"].(string),
+		CustomerName:       booking["customer_name"].(string),
+		CustomerPhone:      booking["customer_phone"].(string),
+		ServiceID:          booking["service_id"].(int64),
+		ServiceName:        booking["service_name"].(string),
+		Price:              booking["price"].(float64),
+		DurationMinutes:    asInt(booking["duration_minutes"]),
+		BarberID:           booking["barber_id"].(int64),
+		BarberName:         booking["barber_name"].(string),
+		BookingDate:        booking["booking_date"].(string),
+		BookingTime:        booking["booking_time"].(string),
+		ChairNumber:        asInt(booking["chair_number"]),
+		Notes:              booking["notes"].(string),
+		TotalAmount:        booking["total_amount"].(float64),
+		PaymentMethod:      booking["payment_method"].(*string),
+		PaymentStatus:      booking["payment_status"].(*string),
 		PaymentRedirectURL: booking["payment_redirect_url"].(*string),
-		PaymentExpiresAt: booking["expires_at"].(*time.Time),
+		PaymentExpiresAt:   booking["expires_at"].(*time.Time),
 	}, nil
 }
 
@@ -218,7 +241,7 @@ func (s *BookingService) RescheduleBooking(ctx context.Context, req dto.Reschedu
 		return errors.New("format jam harus HH:MM")
 	}
 
-	duration := int(booking["duration_minutes"].(int64))
+	duration := asInt(booking["duration_minutes"])
 	hasConflict, err := s.repo.CheckSlotAvailability(ctx, booking["barber_id"].(int64), req.BookingDate, req.BookingTime, duration)
 	if err != nil {
 		return errors.New("gagal memeriksa slot")
@@ -242,7 +265,7 @@ func (s *BookingService) CheckAvailability(ctx context.Context, barberID, servic
 		return nil, errors.New("layanan tidak ditemukan")
 	}
 
-	duration := int(service["duration_minutes"].(int64))
+	duration := asInt(service["duration_minutes"])
 	hasConflict, err := s.repo.CheckSlotAvailability(ctx, barberID, bookingDate, bookingTime, duration)
 	if err != nil {
 		return nil, errors.New("gagal memeriksa slot")
@@ -274,9 +297,12 @@ func (s *BookingService) CreatePayment(ctx context.Context, bookingID, userID in
 		if redirectURL != nil && *redirectURL != "" {
 			return *redirectURL, nil
 		}
-		return "", errors.New("status pembayaran sedang diperbarui")
 	}
-
-	// Create new payment (mock)
-	return "http://localhost:3000/payment/redirect", nil
+	ticketCode, _ := booking["ticket_code"].(string)
+	name, _ := booking["customer_name"].(string)
+	phone, _ := booking["customer_phone"].(string)
+	amount, _ := booking["total_amount"].(float64)
+	serviceName, _ := booking["service_name"].(string)
+	_, _, redirectURL, _, err := s.startPayment(ctx, bookingID, ticketCode, name, phone, amount, serviceName)
+	return redirectURL, err
 }

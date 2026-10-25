@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"encoding/json"
 	"net/http"
 
+	"barber-one/backend/internal/dto"
 	"barber-one/backend/internal/middleware"
 	"barber-one/backend/internal/service"
 )
@@ -35,19 +37,23 @@ func (c *BookingController) CreateBooking(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if _, ok := c.sessionStore.UserIDFromRequest(r); !ok {
+	userID, ok := c.sessionStore.UserIDFromRequest(r)
+	if !ok {
 		middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "Silakan login untuk membuat booking."})
 		return
 	}
 
-	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
-		"message": "Booking dibuat. Selesaikan pembayaran untuk mengonfirmasi jadwal.",
-		"booking": map[string]any{
-			"id":           1,
-			"ticket_code":  "BK-ABC123",
-			"status":       "Menunggu",
-		},
-	})
+	var req dto.CreateBookingRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "Data booking tidak valid."})
+		return
+	}
+	result, err := c.bookingService.CreateBooking(r.Context(), req, userID)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusCreated, result)
 }
 
 // ListUserBookings handles GET /bookings
@@ -65,21 +71,18 @@ func (c *BookingController) ListUserBookings(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if _, ok := c.sessionStore.UserIDFromRequest(r); !ok {
+	userID, ok := c.sessionStore.UserIDFromRequest(r)
+	if !ok {
 		middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "Silakan login untuk melihat booking."})
 		return
 	}
 
-	bookings := []map[string]any{
-		{
-			"id":           1,
-			"ticket_code":  "BK-ABC123",
-			"status":       "Dikonfirmasi",
-			"booking_date": "2026-10-25",
-		},
+	bookings, err := c.bookingService.ListUserBookings(r.Context(), userID)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-
-	middleware.WriteJSON(w, http.StatusOK, map[string][]map[string]any{"bookings": bookings})
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{"bookings": bookings})
 }
 
 // GetBookingDetail handles GET /bookings/{id}
@@ -93,19 +96,18 @@ func (c *BookingController) ListUserBookings(w http.ResponseWriter, r *http.Requ
 // @Failure      404  {object}  map[string]string
 // @Router       /bookings/{id} [get]
 func (c *BookingController) GetBookingDetail(w http.ResponseWriter, r *http.Request, bookingID int64) {
-	if _, ok := c.sessionStore.UserIDFromRequest(r); !ok {
+	userID, ok := c.sessionStore.UserIDFromRequest(r)
+	if !ok {
 		middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "Silakan login."})
 		return
 	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"booking": map[string]any{
-			"id":           bookingID,
-			"ticket_code":  "BK-ABC123",
-			"status":       "Dikonfirmasi",
-			"booking_date": "2026-10-25",
-		},
-	})
+	booking, err := c.bookingService.GetBookingDetail(r.Context(), bookingID, userID)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusNotFound, map[string]string{"error": "Booking tidak ditemukan."})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusOK, map[string]any{"booking": booking})
 }
 
 // CancelBooking handles PATCH /bookings/{id}/cancel
@@ -161,12 +163,17 @@ func (c *BookingController) RescheduleBooking(w http.ResponseWriter, r *http.Req
 // @Failure      409  {object}  map[string]string
 // @Router       /bookings/{id}/payment [post]
 func (c *BookingController) CreatePayment(w http.ResponseWriter, r *http.Request, bookingID int64) {
-	if _, ok := c.sessionStore.UserIDFromRequest(r); !ok {
+	userID, ok := c.sessionStore.UserIDFromRequest(r)
+	if !ok {
 		middleware.WriteJSON(w, http.StatusUnauthorized, map[string]string{"error": "Silakan login."})
 		return
 	}
-
-	middleware.WriteJSON(w, http.StatusCreated, map[string]string{"payment_redirect_url": "http://localhost:3000/payment/redirect"})
+	url, err := c.bookingService.CreatePayment(r.Context(), bookingID, userID)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusCreated, map[string]string{"payment_redirect_url": url})
 }
 
 // CheckAvailability handles GET /availability

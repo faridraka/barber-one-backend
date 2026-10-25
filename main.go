@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
+	_ "barber-one/backend/docs"
 	"barber-one/backend/internal/config"
 	"barber-one/backend/internal/controller"
 	"barber-one/backend/internal/middleware"
 	"barber-one/backend/internal/repository"
 	"barber-one/backend/internal/service"
-	_ "barber-one/backend/docs"
 )
 
 func main() {
@@ -38,7 +38,6 @@ func main() {
 
 	// Initialize services
 	userService := service.NewUserService(repo)
-	bookingService := service.NewBookingService(repo)
 	serviceService := service.NewServiceService(repo)
 	barberService := service.NewBarberService(repo)
 	reviewService := service.NewReviewService(repo)
@@ -49,6 +48,7 @@ func main() {
 	if err != nil {
 		log.Printf("Warning: Midtrans not configured: %v", err)
 	}
+	bookingService := service.NewBookingService(repo, midtransService)
 
 	// Initialize middleware
 	sessionStore := middleware.NewSessionStore()
