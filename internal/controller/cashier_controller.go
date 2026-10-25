@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"time"
@@ -138,4 +139,56 @@ func (c *CashierController) WalkIn(w http.ResponseWriter, r *http.Request) {
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
 		"message": "Walk-in berhasil",
 	})
+}
+
+// UpdateBookingStatus handles PATCH /cashier/bookings/{id}/{start|finish|cancel}
+// @Summary      Mulai, selesaikan, atau batalkan layanan booking
+// @Tags         cashier
+// @Produce      json
+// @Security     BearerAuth
+// @Param        id      path  int     true  "ID booking"
+// @Param        action  path  string  true  "start, finish, atau cancel"
+// @Success      200  {object}  map[string]any
+// @Failure      401  {object}  map[string]string
+// @Failure      404  {object}  map[string]string
+// @Failure      409  {object}  map[string]string
+// @Router       /cashier/bookings/{id}/{action} [patch]
+func (c *CashierController) UpdateBookingStatus(w http.ResponseWriter, r *http.Request, bookingID int64, action string) {
+	if _, ok := c.IsCashier(w, r); !ok {
+		return
+	}
+
+	var (
+		chair   int
+		err     error
+		message string
+	)
+	switch action {
+	case "start":
+		chair, err = c.cashierService.StartService(r.Context(), bookingID)
+		message = "Layanan dimulai."
+	case "finish":
+		err = c.cashierService.FinishService(r.Context(), bookingID)
+		message = "Layanan selesai."
+	case "cancel":
+		err = c.cashierService.CancelService(r.Context(), bookingID)
+		message = "Layanan dibatalkan."
+	}
+
+	var conflict *service.CashierConflictError
+	switch {
+	case err == nil:
+		resp := map[string]any{"message": message}
+		if chair > 0 {
+			resp["chair_number"] = chair
+		}
+		middleware.WriteJSON(w, http.StatusOK, resp)
+	case errors.Is(err, service.ErrBookingNotFound):
+		middleware.WriteJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	case errors.As(err, &conflict):
+		middleware.WriteJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	default:
+		log.Printf("cashier %s booking %d failed: %v", action, bookingID, err)
+		middleware.WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": "Gagal memperbarui status booking."})
+	}
 }

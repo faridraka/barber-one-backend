@@ -754,6 +754,88 @@ func (r *Repository) UpdateBookingChair(ctx context.Context, bookingID, chairID 
 	return tag.RowsAffected(), err
 }
 
+// StartBookingService seats a paid, waiting booking in the first free chair.
+// reason is "" on success, otherwise one of: not_found, status, unpaid, barber_busy, no_chair.
+func (r *Repository) StartBookingService(ctx context.Context, bookingID int64, totalChairs int) (chair int, reason string, err error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	defer tx.Rollback(ctx)
+
+	// Same lock the chair assignment has always used, so two cashiers cannot take one chair.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('barber-one-chairs'))`); err != nil {
+		return 0, "", err
+	}
+
+	var status string
+	var barberID int64
+	var paymentStatus *string
+	err = tx.QueryRow(ctx, `
+		SELECT b.status, b.barber_id,
+		       (SELECT payment_status FROM transactions WHERE booking_id = b.id ORDER BY id DESC LIMIT 1)
+		FROM bookings b WHERE b.id = $1 FOR UPDATE`, bookingID,
+	).Scan(&status, &barberID, &paymentStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "not_found", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+	if status != "Menunggu" && status != "Dikonfirmasi" {
+		return 0, "status", nil
+	}
+	if paymentStatus == nil || *paymentStatus != "Lunas" {
+		return 0, "unpaid", nil
+	}
+
+	var barberBusy bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM bookings WHERE barber_id = $1 AND status = 'Sedang Dilayani')`, barberID,
+	).Scan(&barberBusy); err != nil {
+		return 0, "", err
+	}
+	if barberBusy {
+		return 0, "barber_busy", nil
+	}
+
+	err = tx.QueryRow(ctx, `
+		SELECT c FROM generate_series(1, $1::int) c
+		WHERE c NOT IN (SELECT chair_number FROM bookings WHERE status = 'Sedang Dilayani')
+		ORDER BY c LIMIT 1`, totalChairs,
+	).Scan(&chair)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "no_chair", nil
+	}
+	if err != nil {
+		return 0, "", err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE bookings SET status = 'Sedang Dilayani', chair_number = $1, started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2`,
+		chair, bookingID,
+	); err != nil {
+		return 0, "", err
+	}
+	return chair, "", tx.Commit(ctx)
+}
+
+// EndBookingService moves a booking that is being served to Selesai or Batal.
+func (r *Repository) EndBookingService(ctx context.Context, bookingID int64, status string) (found, updated bool, err error) {
+	tag, err := r.db.Exec(ctx,
+		`UPDATE bookings SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND status = 'Sedang Dilayani'`,
+		status, bookingID,
+	)
+	if err != nil {
+		return false, false, err
+	}
+	if tag.RowsAffected() > 0 {
+		return true, true, nil
+	}
+	err = r.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM bookings WHERE id = $1)`, bookingID).Scan(&found)
+	return found, false, err
+}
+
 func (r *Repository) ExpirePayments(ctx context.Context) (int64, error) {
 	tag, err := r.db.Exec(ctx, `
 		WITH expired AS (

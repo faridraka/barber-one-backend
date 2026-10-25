@@ -66,7 +66,8 @@ func main() {
 	// Initialize workers
 	workerService := service.NewWorkerService(db)
 	workerService.StartPaymentExpiryWorker()
-	workerService.StartBookingAutoStartWorker()
+	// Booking masuk kursi secara manual lewat tombol "Mulai dilayani" di kasir,
+	// jadi StartBookingAutoStartWorker sengaja tidak dijalankan.
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
@@ -196,15 +197,13 @@ layout: "StandaloneLayout"
 	mux.HandleFunc("/api/cashier/bookings/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		if len(parts) == 5 && parts[0] == "api" && parts[1] == "cashier" && parts[2] == "bookings" && r.Method == http.MethodPatch {
-			switch parts[4] {
-			case "finish":
-				middleware.WriteJSON(w, http.StatusOK, map[string]string{"message": "Service finished"})
-			case "cancel":
-				middleware.WriteJSON(w, http.StatusOK, map[string]string{"message": "Service cancelled"})
-			default:
-				http.NotFound(w, r)
+			if bookingID, err := strconv.ParseInt(parts[3], 10, 64); err == nil {
+				switch parts[4] {
+				case "start", "finish", "cancel":
+					cashierController.UpdateBookingStatus(w, r, bookingID, parts[4])
+					return
+				}
 			}
-			return
 		}
 		http.NotFound(w, r)
 	})
