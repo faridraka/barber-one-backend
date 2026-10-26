@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"barber-one/backend/internal/dto"
 	"barber-one/backend/internal/middleware"
@@ -190,10 +191,24 @@ func (c *BookingController) CheckAvailability(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	middleware.WriteJSON(w, http.StatusOK, map[string]any{
-		"barber_id":       1,
-		"service_id":      1,
-		"date":            "2026-10-23",
-		"available_slots": []string{"10:00", "10:45", "11:30"},
+	q := r.URL.Query()
+	barberID, errBarber := strconv.ParseInt(q.Get("barber_id"), 10, 64)
+	serviceID, errService := strconv.ParseInt(q.Get("service_id"), 10, 64)
+	date := q.Get("date")
+	if errBarber != nil || errService != nil || date == "" {
+		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": "barber_id, service_id, dan date wajib diisi."})
+		return
+	}
+
+	slots, err := c.bookingService.CheckAvailability(r.Context(), barberID, serviceID, date)
+	if err != nil {
+		middleware.WriteJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	middleware.WriteJSON(w, http.StatusOK, dto.AvailabilityResponse{
+		BarberID:       barberID,
+		ServiceID:      serviceID,
+		Date:           date,
+		AvailableSlots: slots,
 	})
 }

@@ -42,6 +42,10 @@ func (s *BookingService) CreateBooking(ctx context.Context, req dto.CreateBookin
 		return nil, errors.New("format jam harus HH:MM")
 	}
 
+	if slotHasPassed(req.BookingDate, req.BookingTime) {
+		return nil, errors.New("jam booking sudah lewat. Silakan pilih jam lain")
+	}
+
 	// Get service details
 	service, err := s.repo.GetServiceByID(ctx, req.ServiceID)
 	if err != nil {
@@ -277,25 +281,75 @@ func (s *BookingService) RescheduleBooking(ctx context.Context, req dto.Reschedu
 	return nil
 }
 
-// CheckAvailability checks if a slot is available
-func (s *BookingService) CheckAvailability(ctx context.Context, barberID, serviceID int64, bookingDate, bookingTime string) ([]string, error) {
+// bookingStartTimes must match allBookingSlots in the mobile DateTimeSelector.
+var bookingStartTimes = []string{"10:00", "10:45", "11:30", "12:15", "13:00", "13:45", "14:30", "15:15", "16:00", "16:45", "17:30", "18:15", "19:00", "19:45"}
+
+const closingTime = "21:00"
+
+var wib = time.FixedZone("WIB", 7*60*60)
+
+// clockMinutes converts "HH:MM" to minutes since midnight.
+func clockMinutes(hhmm string) int {
+	t, err := time.Parse("15:04", hhmm)
+	if err != nil {
+		return -1
+	}
+	return t.Hour()*60 + t.Minute()
+}
+
+// slotHasPassed reports whether date+time (WIB) is already in the past.
+func slotHasPassed(date, hhmm string) bool {
+	start, err := time.ParseInLocation("2006-01-02 15:04", date+" "+hhmm, wib)
+	return err != nil || !start.After(time.Now())
+}
+
+// CheckAvailability returns the start times still bookable for a barber, service, and date:
+// not in the past (WIB), not overlapping another active booking, and ending before closing time.
+func (s *BookingService) CheckAvailability(ctx context.Context, barberID, serviceID int64, bookingDate string) ([]string, error) {
+	if _, err := time.Parse("2006-01-02", bookingDate); err != nil {
+		return nil, errors.New("format tanggal harus YYYY-MM-DD")
+	}
 	service, err := s.repo.GetServiceByID(ctx, serviceID)
 	if err != nil {
 		return nil, errors.New("layanan tidak ditemukan")
 	}
-
-	duration := asInt(service["duration_minutes"])
-	hasConflict, err := s.repo.CheckSlotAvailability(ctx, barberID, bookingDate, bookingTime, duration)
+	barber, err := s.repo.GetBarberByID(ctx, barberID)
 	if err != nil {
-		return nil, errors.New("gagal memeriksa slot")
+		return nil, errors.New("barber tidak ditemukan")
 	}
-
-	if hasConflict {
+	if available, _ := barber["available"].(bool); !available {
 		return []string{}, nil
 	}
 
-	// Return available times (mock implementation)
-	return []string{"10:00", "10:45", "11:30"}, nil
+	booked, err := s.repo.GetBookedSlots(ctx, barberID, bookingDate)
+	if err != nil {
+		log.Printf("get booked slots failed: %v", err)
+		return nil, errors.New("gagal memeriksa slot")
+	}
+
+	duration := asInt(service["duration_minutes"])
+	closing := clockMinutes(closingTime)
+	slots := []string{}
+	for _, slot := range bookingStartTimes {
+		start := clockMinutes(slot)
+		end := start + duration
+		if end > closing || slotHasPassed(bookingDate, slot) {
+			continue
+		}
+		conflict := false
+		for _, b := range booked {
+			bStart := clockMinutes(b["booking_time"].(string))
+			bEnd := bStart + asInt(b["duration_minutes"])
+			if start < bEnd && bStart < end {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			slots = append(slots, slot)
+		}
+	}
+	return slots, nil
 }
 
 // CreatePayment creates a new payment transaction
